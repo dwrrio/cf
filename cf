@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+cf — Codeforces helper for competitive programmers
+Usage:
+  cf <problem>        e.g. cf 282/A or cf 282A
+                      fetches examples, scaffolds solution.cpp, opens vim
+  cf test             compile + run all test cases
+  cf add <n>          manually add/overwrite test case n
+"""
+
+import sys
+import os
+import re
+import subprocess
+import shutil
+from pathlib import Path
+
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+CPP_TEMPLATE = """\
+#include <bits/stdc++.h>
+using namespace std;
+
+int main() {
+    ios_base::sync_with_stdio(false);
+    cin.tie(NULL);
+
+    // your solution here
+
+    return 0;
+}
+"""
+
+
+def die(msg):
+    print(f"{RED}error:{RESET} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_problem(arg):
+    """Accept 282/A, 282A, 1234/B1, 1234B1 → ('282', 'A')"""
+    arg = arg.strip().upper()
+    m = re.fullmatch(r'(\d+)[/\-]?([A-Z]\d*)', arg)
+    if not m:
+        die(f"Cannot parse problem id '{arg}'. Expected format: 282/A or 282A")
+    return m.group(1), m.group(2)
+
+
+def problem_dir(contest, index):
+    return Path(f"{contest}_{index}")
+
+
+def fetch_examples(contest, index):
+    """
+    Scrape sample inputs/outputs from the Codeforces problem page.
+    Uses 'requests' if available (better CF compatibility), else urllib.
+    """
+    import html as _html
+
+    url = f"https://codeforces.com/problemset/problem/{contest}/{index}"
+    print(f"{CYAN}fetching{RESET} {url}")
+
+    try:
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        session.get("https://codeforces.com/", timeout=8)
+        resp = session.get(url, timeout=10)
+        resp.raise_for_status()
+        page = resp.text
+    except ImportError:
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/124.0.0.0",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                page = r.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            die(f"Could not fetch problem page: {e}\n"
+                f"  Install 'requests' for better results: pip install requests")
+    except Exception as e:
+        die(f"Could not fetch problem page: {e}")
+
+    def clean(s):
+        s = re.sub(r'<br\s*/?>', '\n', s, flags=re.I)
+        s = re.sub(r'<[^>]+>', '', s)
+        return _html.unescape(s).strip()
+
+
+    inputs, outputs = [], []
+
+    raw_in  = re.findall(
+        r'<div class="input">\s*<div[^>]*>[^<]*</div>\s*<pre>(.*?)</pre>',
+        page, re.S)
+    raw_out = re.findall(
+        r'<div class="output">\s*<div[^>]*>[^<]*</div>\s*<pre>(.*?)</pre>',
+        page, re.S)
+
+    inputs  = [clean(x) for x in raw_in]
+    outputs = [clean(x) for x in raw_out]
+
+    if not inputs:
+        die(
+            "No sample tests found.\n"
+            f"  • Check the problem exists: {url}\n"
+            "  • If CF is blocking, add tests manually: cf add 1"
+        )
+
+    return inputs, outputs
+
+
+def write_examples(folder, inputs, outputs):
+    for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+        (folder / f"in{i}.txt").write_text(inp + "\n")
+        (folder / f"out{i}.txt").write_text(out + "\n")
+    print(f"{GREEN}saved{RESET} {len(inputs)} sample test(s) → {folder}/")
+
+
+def copy_to_clipboard(text):
+    """Try xclip → xsel → wl-copy → pbcopy."""
+    for cmd in (
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+        ["wl-copy"],
+        ["pbcopy"],
+    ):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True)
+                return cmd[0]
+            except Exception:
+                pass
+    return None
+
+
+def cmd_fetch(arg):
+    """cf <problem>  — fetch examples, scaffold solution.cpp, open vim."""
+    contest, index = parse_problem(arg)
+    folder = problem_dir(contest, index)
+    folder.mkdir(exist_ok=True)
+
+    sol = folder / "solution.cpp"
+    if not sol.exists():
+        sol.write_text(CPP_TEMPLATE)
+        print(f"{GREEN}created{RESET} {sol}")
+    else:
+        print(f"{YELLOW}exists{RESET}  {sol}")
+
+    inputs, outputs = fetch_examples(contest, index)
+    write_examples(folder, inputs, outputs)
+
+    os.execlp("vim", "vim", str(sol))
+
+
+def cmd_test():
+    """cf test  — compile solution.cpp and run all test cases."""
+    sol = Path("solution.cpp")
+    if not sol.exists():
+        candidates = list(Path(".").glob("*/solution.cpp"))
+        if len(candidates) == 1:
+            os.chdir(candidates[0].parent)
+            sol = Path("solution.cpp")
+        elif len(candidates) > 1:
+            die("Multiple solution.cpp found — cd into the problem folder first.")
+        else:
+            die("No solution.cpp found. Run `cf <problem>` first or cd into the folder.")
+
+    folder = Path(".")
+
+    print(f"{CYAN}compiling…{RESET}")
+    cc = subprocess.run(
+        ["g++", "-O2", "-std=c++17", "-Wall", "-o", "sol", "solution.cpp"],
+        capture_output=True, text=True,
+    )
+    if cc.returncode != 0:
+        print(f"{RED}{BOLD}COMPILE ERROR{RESET}")
+        print(cc.stderr)
+        sys.exit(1)
+    print(f"{GREEN}compiled ok{RESET}")
+
+    in_files = sorted(folder.glob("in*.txt"),
+                      key=lambda p: int(re.search(r'\d+', p.name).group()))
+    if not in_files:
+        die("No in*.txt test files. Run `cf <problem>` or `cf add <n>` to add them.")
+
+    all_ok = True
+    for in_f in in_files:
+        n = re.search(r'\d+', in_f.name).group()
+        out_f = folder / f"out{n}.txt"
+        expected = out_f.read_text().strip() if out_f.exists() else None
+
+        try:
+            run = subprocess.run(
+                ["./sol"],
+                input=in_f.read_text(),
+                capture_output=True, text=True,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"{RED}{BOLD}TLE{RESET}      test {n}")
+            all_ok = False
+            continue
+
+        actual = run.stdout.strip()
+        ok = (expected is None) or (actual == expected)
+
+        if ok:
+            print(f"{GREEN}ok{RESET}       test {n}")
+        else:
+            all_ok = False
+            print(f"{RED}{BOLD}WRONG{RESET}    test {n}")
+            print(f"  {BOLD}input:{RESET}")
+            for line in in_f.read_text().strip().splitlines():
+                print(f"    {line}")
+            print(f"  {BOLD}expected:{RESET}")
+            for line in expected.splitlines():
+                print(f"    {line}")
+            print(f"  {BOLD}got:{RESET}")
+            for line in actual.splitlines():
+                print(f"    {line}")
+            if run.stderr.strip():
+                print(f"  {BOLD}stderr:{RESET}")
+                for line in run.stderr.strip().splitlines():
+                    print(f"    {line}")
+
+    print()
+    if all_ok:
+        print(f"{GREEN}{BOLD}CORRECT{RESET}")
+        tool = copy_to_clipboard(sol.read_text())
+        if tool:
+            print(f"{CYAN}solution copied to clipboard{RESET}  ({tool})")
+        else:
+            print(f"{YELLOW}clipboard tool not found{RESET} — install xclip or wl-copy")
+    else:
+        print(f"{RED}{BOLD}ERROR{RESET}")
+        sys.exit(1)
+
+
+def cmd_add(n):
+    """cf add <n>  — manually add/overwrite test case n."""
+    folder = Path(".")
+    if not (folder / "solution.cpp").exists():
+        die("Run from inside a problem folder (solution.cpp not found).")
+
+    in_f  = folder / f"in{n}.txt"
+    out_f = folder / f"out{n}.txt"
+
+    print(f"Paste input for test {n}, then press Ctrl-D:")
+    inp = sys.stdin.read()
+    in_f.write_text(inp if inp.endswith("\n") else inp + "\n")
+
+    print(f"Paste expected output for test {n}, then press Ctrl-D:")
+    out = sys.stdin.read()
+    out_f.write_text(out if out.endswith("\n") else out + "\n")
+
+    print(f"{GREEN}saved{RESET} test {n}  ({in_f}, {out_f})")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__.strip())
+        sys.exit(0)
+
+    cmd = args[0].lower()
+    if cmd == "test":
+        cmd_test()
+    elif cmd == "add":
+        if len(args) < 2:
+            die("Usage: cf add <n>")
+        cmd_add(args[1])
+    else:
+        cmd_fetch(args[0])
+
+
+if __name__ == "__main__":
+    main()
